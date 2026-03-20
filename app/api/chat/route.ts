@@ -1,5 +1,6 @@
-import { GoogleGenAI } from "@google/genai";
 import { NextResponse } from "next/server";
+import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
 
 type Message = {
   role: "user" | "assistant";
@@ -10,36 +11,136 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function extractTextFromError(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return "Lỗi không xác định.";
-  }
+function getLastUserMessage(messages: Message[]) {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  return lastUser?.content?.trim() || "";
 }
 
-function isRateLimitError(message: string) {
-  const text = message.toLowerCase();
-  return (
-    text.includes("429") ||
-    text.includes("resource_exhausted") ||
-    text.includes("quota") ||
-    text.includes("rate limit")
-  );
+function buildFriendlyFallback(messages: Message[]) {
+  const last = getLastUserMessage(messages).toLowerCase();
+
+  if (!last) {
+    return "Mình vẫn đang ở đây. Bạn nhắn lại câu hỏi giúp mình nhé.";
+  }
+
+  if (last.includes("hello") || last.includes("hi") || last.includes("chào")) {
+    return "Chào bạn 👋 Mình vẫn hoạt động bình thường nè. Bạn cần mình giúp gì tiếp?";
+  }
+
+  if (last.includes("code") || last.includes("lập trình") || last.includes("javascript")) {
+    return "Mình đang tạm bận kết nối AI chính, nhưng mình vẫn có thể hỗ trợ cơ bản. Bạn gửi rõ đoạn code hoặc yêu cầu cụ thể, mình sẽ giúp theo cách ngắn gọn và dễ hiểu.";
+  }
+
+  return `Mình đang gặp trục trặc kết nối AI chính, nhưng mình vẫn nhận được câu hỏi của bạn: "${getLastUserMessage(
+    messages
+  )}". Bạn thử gửi lại sau ít phút, hoặc nhắn rõ hơn để mình hỗ trợ theo cách đơn giản nhất nhé.`;
+}
+
+function normalizeMessages(messages: Message[]) {
+  return messages
+    .filter((m) => m.content?.trim())
+    .map((m) => ({
+      role: m.role,
+      content: m.content.trim(),
+    }));
+}
+
+async function tryGemini(messages: Message[]) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("NO_GEMINI_KEY");
+
+  const ai = new GoogleGenAI({ apiKey });
+
+  const history = messages
+    .map((m) => `${m.role === "user" ? "Người dùng" : "Trợ lý"}: ${m.content}`)
+    .join("\n");
+
+  const prompt = `
+Bạn là AI Thông Thái, trợ lý AI nói tiếng Việt, thân thiện, dễ hiểu, tự nhiên.
+Nguyên tắc:
+- Trả lời rõ ràng, ấm áp
+- Không quá máy móc
+- Ưu tiên ngắn gọn nhưng đủ ý
+- Nếu hỏi code, giải thích dễ hiểu cho người mới
+
+Lịch sử hội thoại:
+${history}
+
+Hãy trả lời tin nhắn cuối cùng của người dùng.
+`.trim();
+
+  const models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"];
+  const delays = [0, 1200, 2500];
+
+  let lastError = "Gemini failed";
+
+  for (const model of models) {
+    for (const delay of delays) {
+      if (delay) await sleep(delay);
+
+      try {
+        const res = await ai.models.generateContent({
+          model,
+          contents: prompt,
+        });
+
+        const text = res.text?.trim();
+        if (text) return text;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  throw new Error(`GEMINI_FAILED: ${lastError}`);
+}
+
+async function tryOpenAI(messages: Message[]) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("NO_OPENAI_KEY");
+
+  const client = new OpenAI({ apiKey });
+
+  const normalized = normalizeMessages(messages);
+
+  const models = ["gpt-4.1-mini", "gpt-4.1"];
+  const delays = [0, 1200];
+
+  let lastError = "OpenAI failed";
+
+  for (const model of models) {
+    for (const delay of delays) {
+      if (delay) await sleep(delay);
+
+      try {
+        const completion = await client.chat.completions.create({
+          model,
+          messages: [
+            {
+              role: "system",
+              content:
+                "Bạn là AI Thông Thái, trợ lý AI nói tiếng Việt, thân thiện, rõ ràng, dễ hiểu.",
+            },
+            ...normalized.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+          ],
+        });
+
+        const text = completion.choices[0]?.message?.content?.trim();
+        if (text) return text;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
+  throw new Error(`OPENAI_FAILED: ${lastError}`);
 }
 
 export async function POST(req: Request) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Thiếu GEMINI_API_KEY trong .env.local" },
-        { status: 500 }
-      );
-    }
-
     const body = await req.json();
     const messages = body?.messages as Message[] | undefined;
 
@@ -50,79 +151,34 @@ export async function POST(req: Request) {
       );
     }
 
-    const ai = new GoogleGenAI({ apiKey });
-
-    const history = messages
-      .map((m) => `${m.role === "user" ? "Người dùng" : "Trợ lý"}: ${m.content}`)
-      .join("\n");
-
-    const prompt = `
-Bạn là AI Thông Thái, một trợ lý AI nói tiếng Việt, thân thiện, tự nhiên, dễ hiểu.
-Nguyên tắc:
-- Trả lời ấm áp, ngắn gọn nhưng đủ ý
-- Không quá máy móc
-- Nếu người dùng hỏi code, giải thích dễ hiểu cho người mới
-- Có thể xưng "mình" và gọi người dùng là "bạn"
-
-Lịch sử hội thoại:
-${history}
-
-Hãy trả lời tin nhắn cuối cùng của người dùng.
-`.trim();
-
-    const modelsToTry = ["gemini-1.5-flash", "gemini-2.0-flash"];
-    const retryDelays = [0, 1500, 3500];
-
-    let lastError = "Không gọi được Gemini API.";
-
-    for (const model of modelsToTry) {
-      for (const delay of retryDelays) {
-        if (delay > 0) {
-          await sleep(delay);
-        }
-
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            contents: prompt,
-          });
-
-          const reply =
-            response.text?.trim() ||
-            "Mình chưa nghĩ ra câu trả lời phù hợp, bạn nhắn lại giúp mình nhé.";
-
-          return NextResponse.json({ reply });
-        } catch (error) {
-          const message = extractTextFromError(error);
-          lastError = message;
-
-          if (!isRateLimitError(message)) {
-            break;
-          }
-        }
-      }
+    try {
+      const reply = await tryGemini(messages);
+      return NextResponse.json({ reply, provider: "gemini" });
+    } catch (geminiError) {
+      console.error("Gemini error:", geminiError);
     }
 
-    if (isRateLimitError(lastError)) {
-      return NextResponse.json(
-        {
-          error:
-            "AI đang bận hoặc bạn đã chạm giới hạn miễn phí. Bạn thử lại sau ít phút nhé.",
-        },
-        { status: 429 }
-      );
+    try {
+      const reply = await tryOpenAI(messages);
+      return NextResponse.json({ reply, provider: "openai" });
+    } catch (openaiError) {
+      console.error("OpenAI error:", openaiError);
     }
 
-    return NextResponse.json(
-      { error: "Mình chưa kết nối được AI lúc này. Bạn thử lại nhé." },
-      { status: 500 }
-    );
+    const fallbackReply = buildFriendlyFallback(messages);
+    return NextResponse.json({
+      reply: fallbackReply,
+      provider: "local-fallback",
+    });
   } catch (error) {
-    console.error("Gemini API error:", error);
+    console.error("API fatal error:", error);
 
     return NextResponse.json(
-      { error: "Có lỗi máy chủ. Bạn thử lại sau nhé." },
-      { status: 500 }
+      {
+        reply: "Mình đang lỗi một chút nhưng vẫn ở đây. Bạn thử gửi lại sau ít phút nhé.",
+        provider: "emergency-fallback",
+      },
+      { status: 200 }
     );
   }
 }
