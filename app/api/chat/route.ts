@@ -1,100 +1,95 @@
+import OpenAI from "openai";
 import { NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const apiKey = process.env.GEMINI_API_KEY!;
-const genAI = new GoogleGenerativeAI(apiKey);
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+const client = new OpenAI({
+  apiKey: process.env.GPTGE_API_KEY,
+  baseURL: "https://api.gpt.ge/v1",
+});
 
 function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function shuffle(array: string[]) {
-  return [...array].sort(() => Math.random() - 0.5);
-}
-
-function extractError(error: unknown) {
-  if (!error) return "Unknown error";
-  if (error instanceof Error) return error.message;
-  try {
-    return JSON.stringify(error);
-  } catch {
-    return String(error);
-  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const prompt = body.message;
-
-    if (!prompt) {
-      return NextResponse.json({ error: "Thiếu message" }, { status: 400 });
+    if (!process.env.GPTGE_API_KEY) {
+      return NextResponse.json(
+        { error: "Thiếu GPTGE_API_KEY trong .env.local" },
+        { status: 500 }
+      );
     }
 
-    // 🔥 LIST MODEL (lọc chỉ text model)
-    const models = [
-      "gemini-1.5-flash",
-      "gemini-2.0-flash",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-      "gemini-3-flash",
-      "gemini-3.1-flash-lite",
-      "gemini-3.1-pro",
+    const body = await req.json();
+    const messages = body?.messages as Message[] | undefined;
+
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return NextResponse.json(
+        { error: "Thiếu messages hợp lệ." },
+        { status: 400 }
+      );
+    }
+
+    // Đổi các model này theo model bạn thấy trong dashboard api.gpt.ge
+    const modelsToTry = [
+      "gpt-4o-mini",
+      "gpt-4.1-mini",
+      "gpt-4o",
     ];
 
-    // 🔀 random thứ tự mỗi request
-    const randomizedModels = shuffle(models);
+    const retryDelays = [0, 1200, 2500];
+    let lastError = "Không gọi được api.gpt.ge";
 
-    // 🔁 retry delay
-    const delays = [0, 1000, 2000];
+    for (const model of modelsToTry) {
+      for (const delay of retryDelays) {
+        if (delay > 0) await sleep(delay);
 
-    let lastError = "";
-
-    for (const model of randomizedModels) {
-      for (const delay of delays) {
         try {
-          if (delay) await sleep(delay);
+          const completion = await client.chat.completions.create({
+            model,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Bạn là AI Thông Thái, trả lời bằng tiếng Việt, thân thiện, dễ hiểu, gọn gàng.",
+              },
+              ...messages.map((m) => ({
+                role: m.role,
+                content: m.content,
+              })),
+            ],
+          });
 
-          console.log("🚀 thử:", model);
-
-          const modelInstance = genAI.getGenerativeModel({ model });
-
-          const result = await modelInstance.generateContent(prompt);
-
-          const text =
-            result.response.text()?.trim() ||
+          const reply =
+            completion.choices[0]?.message?.content?.trim() ||
             "Mình chưa có câu trả lời phù hợp.";
 
           return NextResponse.json({
-            reply: text,
-            provider: "gemini",
+            reply,
+            provider: "api.gpt.ge",
             model,
           });
-        } catch (err) {
-          const msg = extractError(err);
-          lastError = msg;
-
-          console.log("❌ lỗi:", model, msg);
-
-          // ❗ không break → thử model khác
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
+          console.error("api.gpt.ge error:", model, lastError);
         }
       }
     }
 
-    // 💀 fallback cuối
-    return NextResponse.json({
-      reply:
-        "AI đang quá tải 😢 thử lại sau vài giây hoặc đổi câu hỏi nhé.",
-      provider: "fallback",
-      error: lastError,
-    });
-  } catch (err) {
     return NextResponse.json(
       {
-        reply: "Server lỗi 😢",
-        error: extractError(err),
+        error: `Tất cả model đều lỗi. Lỗi cuối: ${lastError}`,
       },
       { status: 500 }
     );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Lỗi máy chủ không xác định.";
+
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
