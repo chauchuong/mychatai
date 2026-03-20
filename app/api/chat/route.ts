@@ -6,6 +6,29 @@ type Message = {
   content: string;
 };
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractTextFromError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Lỗi không xác định.";
+  }
+}
+
+function isRateLimitError(message: string) {
+  const text = message.toLowerCase();
+  return (
+    text.includes("429") ||
+    text.includes("resource_exhausted") ||
+    text.includes("quota") ||
+    text.includes("rate limit")
+  );
+}
+
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -34,35 +57,72 @@ export async function POST(req: Request) {
       .join("\n");
 
     const prompt = `
-Bạn là trợ lý AI nói tiếng Việt, cực kỳ thân thiện, tự nhiên, lễ phép và dễ gần.
-Nguyên tắc trả lời:
-- Trả lời rõ ràng, ấm áp, giống đang hỗ trợ thật
-- Không quá máy móc, không cộc lốc
-- Ưu tiên ngắn gọn nhưng vẫn đủ ý
+Bạn là AI Thông Thái, một trợ lý AI nói tiếng Việt, thân thiện, tự nhiên, dễ hiểu.
+Nguyên tắc:
+- Trả lời ấm áp, ngắn gọn nhưng đủ ý
+- Không quá máy móc
 - Nếu người dùng hỏi code, giải thích dễ hiểu cho người mới
 - Có thể xưng "mình" và gọi người dùng là "bạn"
-- Khi phù hợp, mở đầu nhẹ nhàng như "Được nhé", "Ok, mình giúp bạn", "Mình nghĩ cách này ổn"
-- bạn tên là "AI thông thái" nếu có người hỏi bạn tên
+
 Lịch sử hội thoại:
 ${history}
 
 Hãy trả lời tin nhắn cuối cùng của người dùng.
 `.trim();
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-    });
+    const modelsToTry = ["gemini-1.5-flash", "gemini-2.0-flash"];
+    const retryDelays = [0, 1500, 3500];
 
-    const reply = response.text?.trim() || "Mình chưa nghĩ ra câu trả lời phù hợp, bạn nhắn lại giúp mình nhé.";
+    let lastError = "Không gọi được Gemini API.";
 
-    return NextResponse.json({ reply });
+    for (const model of modelsToTry) {
+      for (const delay of retryDelays) {
+        if (delay > 0) {
+          await sleep(delay);
+        }
+
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            contents: prompt,
+          });
+
+          const reply =
+            response.text?.trim() ||
+            "Mình chưa nghĩ ra câu trả lời phù hợp, bạn nhắn lại giúp mình nhé.";
+
+          return NextResponse.json({ reply });
+        } catch (error) {
+          const message = extractTextFromError(error);
+          lastError = message;
+
+          if (!isRateLimitError(message)) {
+            break;
+          }
+        }
+      }
+    }
+
+    if (isRateLimitError(lastError)) {
+      return NextResponse.json(
+        {
+          error:
+            "AI đang bận hoặc bạn đã chạm giới hạn miễn phí. Bạn thử lại sau ít phút nhé.",
+        },
+        { status: 429 }
+      );
+    }
+
+    return NextResponse.json(
+      { error: "Mình chưa kết nối được AI lúc này. Bạn thử lại nhé." },
+      { status: 500 }
+    );
   } catch (error) {
     console.error("Gemini API error:", error);
 
-    const message =
-      error instanceof Error ? error.message : "Không gọi được Gemini API.";
-
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json(
+      { error: "Có lỗi máy chủ. Bạn thử lại sau nhé." },
+      { status: 500 }
+    );
   }
 }
